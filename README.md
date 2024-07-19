@@ -3,6 +3,10 @@ Performance improvement in GPT
 
 [Gradio-App](https://huggingface.co/spaces/alokchauhan13/gpt2Train-Assigment21-gradio)
 
+![Gradio Application output](./out/gradio-app-output-1.png)
+
+![Gradio Application output](./out/gradio-app-output-2.png)
+
 ## 1- Setting basic structure of GPT
 
 - Load pre trained model from gpt2

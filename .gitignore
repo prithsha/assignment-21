@@ -20,3 +20,4 @@ MANIFEST
 
 env.bak/
 venv.bak/
+out/ckpt.pt

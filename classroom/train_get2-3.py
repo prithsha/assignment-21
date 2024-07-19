@@ -192,7 +192,10 @@ tokens = enc.encode(text)
 B, T = 4, 32
 buf = torch.tensor(tokens[:B*T + 1])
 buf = buf.to(device)
+
+# input
 x = buf[:-1].view(B, T)
+# prediction
 y = buf[1:].view(B, T)
 
 model = GPT(GPTConfig())

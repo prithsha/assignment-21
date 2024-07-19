@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
+from torch.cuda.amp.grad_scaler import GradScaler
 
 class CausalSelfAttention(nn.Module):
 
@@ -86,6 +86,8 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
+    B : int = 16
+    T : int = 1024
 
 
 class GPT(nn.Module):
@@ -118,8 +120,6 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std = 0.02)
-
-
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
@@ -190,6 +190,31 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
 # model = GPT.from_pretrained('gpt2')
 
 device = 'cpu'
@@ -203,12 +228,6 @@ print(f"using device: {device}")
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
-
-# STOP
-num_return_sequences = 5
-max_length = 30
-
-
 
 import tiktoken
 
@@ -241,19 +260,8 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 
-# CHANGES IN CURRENT CODE
-torch.set_float32_matmul_precision('high')
-model = GPT(GPTConfig())
-model.to(device)
-# model = torch.compile(model)
 
-# CODE UPDATE HERE
-max_lr = 6e-4 
-min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
-
-def get_lr(it):
+def get_lr(it, warmup_steps, max_steps, min_lr, max_lr):
     if it < warmup_steps:
         return max_lr * (it + 1) / warmup_steps
     if it > max_steps:
@@ -263,61 +271,79 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
 
-train_loader = DataLoaderLite(B = 16, T = 1024)
+def train(warmup_steps=50, max_steps=5000, min_lr=6e-5, max_lr=6e-4, gpt_config = None):
 
-# NEW CODE
-import time
-optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4, betas=(0.9, 0.95), eps=1e-8)
-for step in range(50):
-    t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-    optimizer.zero_grad()
-    # NEW CODE ADDED HERE
-    # Change bfloat16 to float16 if giving error
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y) 
-    loss.backward()
-    norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
-    # NEW CODE
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    if(gpt_config is None):
+        gpt_config = GPTConfig()
 
-    optimizer.step()
-    torch.cuda.synchronize() 
-    t1 = time.time()
-    dt = (t1 - t0) * 1000
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f'step{step} | loss: {loss.item()} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec: .2f} | norm: {norm:.2f}')
+    torch.set_float32_matmul_precision('high')
+    model = GPT(gpt_config)
+    model.to(device)
+    # For linux machine
+    # model = torch.compile(model)
+
+    train_loader = DataLoaderLite(B = gpt_config.B, T = gpt_config.T)   
+    # optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4, betas=(0.9, 0.95), eps=1e-8)
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+    scaler = GradScaler()
+    for step in range(max_steps):
+        t0 = time.time()
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        # NEW CODE ADDED HERE
+        with torch.autocast(device_type=device, dtype=torch.float16):
+            logits, loss = model(x, y) 
+        scaler.scale(loss).backward()
+
+        scaler.unscale_(optimizer)
+        norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
+        # NEW CODE
+        lr = get_lr(step,warmup_steps, max_steps, min_lr, max_lr)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+            
+        scaler.step(optimizer)
+        scaler.update()
+        torch.cuda.synchronize() 
+        t1 = time.time()
+        dt = (t1 - t0) * 1000
+        tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+        print(f'step{step} | loss: {loss.item()} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec: .2f} | norm: {norm:.2f}')
+        # print(loss)
+
+    torch.save(model.state_dict(), os.path.join('out', 'ckpt.pt'))   
+
+# import sys; sys.exit(0)
 
 
-print(loss)
-import sys; sys.exit(0)
+# # STOP
+# num_return_sequences = 5
+# max_length = 30
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-        logits = model(x)[0] # (B, T, vocab_size)
-        # take the logits at the last position
-        logits = logits[:, -1, :] # (B, vocab_size)
-        # get the probabilities
-        probs = F.softmax(logits, dim=-1)
-        # do top-k sampling of 50 (huggingface pipeline default)
-        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from the top-k probabilities
-        # note: multinomial does not demand the input to sum to 1
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        # append to the sequence
-        x = torch.cat((x, xcol), dim=1)
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
+# while x.size(1) < max_length:
+#     # forward the model to get the logits
+#     with torch.no_grad():
+#         logits = model(x)[0] # (B, T, vocab_size)
+#         # take the logits at the last position
+#         logits = logits[:, -1, :] # (B, vocab_size)
+#         # get the probabilities
+#         probs = F.softmax(logits, dim=-1)
+#         # do top-k sampling of 50 (huggingface pipeline default)
+#         # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+#         # select a token from the top-k probabilities
+#         # note: multinomial does not demand the input to sum to 1
+#         ix = torch.multinomial(topk_probs, 1) # (B, 1)
+#         # gather the corresponding indices
+#         xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+#         # append to the sequence
+#         x = torch.cat((x, xcol), dim=1)
 
-# print the generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+# # print the generated text
+# for i in range(num_return_sequences):
+#     tokens = x[i, :max_length].tolist()
+#     decoded = enc.decode(tokens)
+#     print(">", decoded)
